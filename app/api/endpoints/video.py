@@ -1,139 +1,209 @@
-from fastapi import APIRouter, UploadFile, HTTPException, BackgroundTasks, File
-from ...utils.file_handlers import save_upload_file
-from ...core.yolo_detector import LogoDetector
-from ...core.llm_analyzer import LLMAnalyzer
-from typing import Dict, Any
-import os
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pathlib import Path
+import os
+import shutil
+import uuid
+import json
+from datetime import datetime
+from app.core.yolo_detector import LogoDetector
+from app.core.llm_analyzer import LLMAnalyzer
 from app.utils.logger import setup_logger
 
 router = APIRouter()
 logo_detector = LogoDetector()
 llm_analyzer = LLMAnalyzer()
-logger = setup_logger("video_endpoint")
 
-# 분석 결과를 저장할 임시 저장소
-analysis_results: Dict[str, Any] = {}
+logger = setup_logger("video_router")
 
+UPLOAD_DIR = Path("uploads")
+RESULTS_DIR = Path("results")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 기존 /upload 엔드포인트 복원 (기존 클라이언트 호환성 유지)
 @router.post("/upload")
-async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    sample_rate: int = Form(30)
+):
     """
-    비디오 파일을 업로드하고 로고 분석을 시작합니다.
-    
-    Args:
-        background_tasks (BackgroundTasks): 백그라운드 작업 관리자
-        file (UploadFile): 업로드할 비디오 파일
-        
-    Returns:
-        dict: 업로드 결과 정보
+    기존 클라이언트와의 호환성을 위해 /upload 엔드포인트 유지
+    /analyze 엔드포인트와 동일한 기능
     """
-    logger.info(f"비디오 업로드 시작: {file.filename}")
+    response = await analyze_video(background_tasks, file, sample_rate)
     
+    # 프론트엔드에서 사용하기 쉽게 filename 필드 추가
+    content = response.body.decode()
+    data = json.loads(content)
+    data["filename"] = data.get("file_id")  # 기존 클라이언트 호환성을 위해 filename 필드 추가
+    
+    return JSONResponse(content=data)
+
+@router.post("/analyze")
+async def analyze_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    sample_rate: int = Form(30)
+):
+    # 업로드 파일명 생성 (고유 ID)
+    file_id = str(uuid.uuid4())
+    file_extension = os.path.splitext(file.filename)[1]
+    upload_path = UPLOAD_DIR / f"{file_id}{file_extension}"
+    
+    logger.info(f"비디오 업로드 시작: {file.filename} -> {upload_path}")
+    
+    # 파일 저장
     try:
-        # 임시 파일 저장
-        temp_path = Path("temp") / file.filename
-        temp_path.parent.mkdir(exist_ok=True)
-        
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        logger.info(f"비디오 파일 저장 완료: {temp_path}")
-        
-        # 초기 상태 설정
-        analysis_results[file.filename] = {
-            "status": "processing",
-            "message": "분석이 시작되었습니다."
-        }
-        
-        # 백그라운드에서 로고 감지 및 분석 수행
-        background_tasks.add_task(process_video, str(temp_path), file.filename)
-        
-        return {
-            "message": "파일이 성공적으로 업로드되었습니다. 분석이 시작되었습니다.",
-            "filename": file.filename
-        }
+        with open(upload_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        logger.error(f"비디오 업로드 중 오류 발생: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/analysis/{filename}")
-async def get_analysis(filename: str):
-    """
-    비디오 분석 결과를 조회합니다.
+        logger.error(f"파일 저장 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"파일 저장 실패: {str(e)}")
+    finally:
+        file.file.close()
     
-    Args:
-        filename (str): 분석 결과를 조회할 파일 이름
+    logger.info(f"비디오 업로드 완료: {upload_path}")
+    
+    # 백그라운드 작업으로 처리
+    background_tasks.add_task(process_video, upload_path, sample_rate, file_id, file.filename)
+    
+    return JSONResponse(content={
+        "message": "비디오 분석이 시작되었습니다.",
+        "file_id": file_id
+    })
+
+# 기존 /analysis/{filename} 엔드포인트도 복원 (기존 클라이언트 호환성 유지)
+@router.get("/analysis/{file_id}")
+async def get_analysis(file_id: str):
+    """
+    기존 클라이언트와의 호환성을 위해 /analysis 엔드포인트 유지
+    /result 엔드포인트와 동일한 기능
+    """
+    # 'undefined'가 전달된 경우 적절한 오류 메시지 반환
+    if file_id == "undefined":
+        logger.warning("클라이언트가 'undefined'를 file_id로 전송했습니다.")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "잘못된 file_id: 'undefined'가 전달되었습니다. 파일을 먼저 업로드하고 반환된 file_id를 사용하세요."
+            }
+        )
         
-    Returns:
-        dict: 분석 결과
-    """
-    if filename not in analysis_results:
-        raise HTTPException(status_code=404, detail="분석 결과를 찾을 수 없습니다.")
+    # 처리중인지 확인
+    result_path = RESULTS_DIR / f"{file_id}.json"
+    if result_path.exists():
+        with open(result_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if data.get("status") == "processing":
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "status": "processing",
+                        "message": "분석이 진행 중입니다. 잠시 후 다시 시도해주세요."
+                    }
+                )
     
-    result = analysis_results[filename]
-    if result.get("status") == "processing":
-        raise HTTPException(status_code=202, detail="분석이 진행 중입니다.")
-    
-    return {
-        "analysis": result.get("analysis", {}),
-        "status": result.get("status"),
-        "message": result.get("message")
-    }
+    return await get_analysis_result(file_id)
 
-@router.get("/status/{filename}")
-async def get_processing_status(filename: str):
-    """
-    비디오 처리 상태를 조회합니다.
+@router.get("/result/{file_id}")
+async def get_analysis_result(file_id: str):
+    # 'undefined'가 전달된 경우 적절한 오류 메시지 반환
+    if file_id == "undefined":
+        logger.warning("클라이언트가 'undefined'를 file_id로 전송했습니다.")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "잘못된 file_id: 'undefined'가 전달되었습니다. 파일을 먼저 업로드하고 반환된 file_id를 사용하세요."
+            }
+        )
     
-    Args:
-        filename (str): 상태를 조회할 파일 이름
-        
-    Returns:
-        dict: 처리 상태 정보
-    """
-    if filename not in analysis_results:
-        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    # 결과 파일 경로
+    result_path = RESULTS_DIR / f"{file_id}.json"
     
-    return {
-        "status": analysis_results[filename].get("status", "unknown"),
-        "filename": filename,
-        "message": analysis_results[filename].get("message", "")
-    }
-
-async def process_video(file_path: str, filename: str):
-    """
-    비디오 파일을 처리하여 로고를 감지하고 분석합니다.
+    if not result_path.exists():
+        raise HTTPException(status_code=404, detail="분석 결과가 아직 준비되지 않았습니다.")
     
-    Args:
-        file_path (str): 처리할 비디오 파일 경로
-        filename (str): 처리할 파일 이름
-    """
     try:
-        # YOLO 감지
-        detector = LogoDetector()
-        detections = detector.detect_logos(Path(file_path))
+        with open(result_path, "r", encoding="utf-8") as f:
+            result = json.load(f)
         
-        # LLM 분석
-        analyzer = LLMAnalyzer()
-        analysis = analyzer.analyze_detections(detections)
+        # 프론트엔드 호환성을 위해 응답 구조 조정
+        if "analysis_results" in result:
+            result["analysis"] = result.get("analysis_results")
+            
+        # 기존 클라이언트 호환성을 위해 필요한 경우 필드 추가
+        if "filename" not in result and "file_id" in result:
+            result["filename"] = result["file_id"]
         
-        # 결과 저장
-        analysis_results[filename] = {
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.error(f"결과 파일 읽기 실패: {e}")
+        raise HTTPException(status_code=500, detail="결과 파일을 읽는 중 오류가 발생했습니다.")
+
+async def process_video(video_path: Path, sample_rate: int, file_id: str, original_filename: str):
+    """
+    비디오를 처리하고 결과를 저장하는 백그라운드 작업
+    """
+    logger.info(f"비디오 처리 시작: {video_path}, 샘플링 레이트: {sample_rate}")
+    result_path = RESULTS_DIR / f"{file_id}.json"
+    
+    try:
+        # 처리 상태 저장
+        save_result_status(result_path, "processing", "비디오 분석 진행 중...")
+        
+        # 로고 감지
+        detections = logo_detector.detect_logos(video_path, sample_rate)
+        logger.info(f"로고 감지 완료: {len(detections)}개 감지됨")
+        
+        # LLM 분석 (비디오 경로 전달하여 오디오 추출 및 분석 활성화)
+        analysis_results = llm_analyzer.analyze_detections(detections, video_path)
+        logger.info(f"LLM 분석 완료: {len(analysis_results)}개 로고 분석됨")
+        
+        # 결과 저장 - 프론트엔드와 호환되는 형식
+        result = {
             "status": "completed",
-            "message": "분석이 완료되었습니다.",
-            "detections": detections,
-            "analysis": analysis
+            "message": "비디오 분석이 완료되었습니다.",
+            "file_id": file_id,
+            "filename": file_id,  # 프론트엔드 호환성
+            "original_filename": original_filename,
+            "analysis_time": datetime.now().isoformat(),
+            "sample_rate": sample_rate,
+            "total_detections": len(detections),
+            "analysis_results": analysis_results,
+            "analysis": analysis_results  # 프론트엔드 호환성
         }
         
-        # 임시 파일 삭제
-        Path(file_path).unlink()
-        logger.info("임시 파일 삭제 완료")
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+            
+        logger.info(f"분석 결과 저장 완료: {result_path}")
         
-        logger.info("비디오 처리 완료")
     except Exception as e:
-        logger.error(f"비디오 처리 중 오류 발생: {str(e)}")
-        analysis_results[filename] = {
-            "status": "error",
-            "message": f"처리 중 오류가 발생했습니다: {str(e)}"
-        } 
+        logger.error(f"비디오 처리 중 오류 발생: {e}")
+        save_result_status(result_path, "error", f"처리 중 오류가 발생했습니다: {str(e)}")
+    finally:
+        # 임시 비디오 파일 삭제 여부 선택
+        # 필요에 따라 주석 해제
+        # if video_path.exists():
+        #     os.unlink(video_path)
+        #     logger.info(f"임시 비디오 파일 삭제 완료: {video_path}")
+        pass
+
+def save_result_status(result_path: Path, status: str, message: str):
+    """
+    분석 상태 정보를 JSON 파일로 저장합니다.
+    """
+    result = {
+        "status": status,
+        "message": message,
+        "update_time": datetime.now().isoformat()
+    }
+    
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"상태 정보 저장 완료: {result_path} ({status})") 
