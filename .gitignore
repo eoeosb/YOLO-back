@@ -1,0 +1,7 @@
+﻿.venv/Lib
+.venv
+__pycache__
+app/__init__.py
+.env
+app/api/endpoints/__init__.py
+app/api/__init__.py
