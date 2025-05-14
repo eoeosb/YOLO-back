@@ -174,7 +174,27 @@ class LLMAnalyzer:
             if logo_name not in logo_groups:
                 logo_groups[logo_name] = []
             logo_groups[logo_name].append(detection)
+            
+        # 대략적인 영상 길이 계산
+        video_duration = max(d["timestamp"] for d in detections) if detections else 0
         
+        # 전체 대본을 시간대별로 나누기
+        time_segmented_transcript = []
+        if transcript and video_duration > 0:
+            # 영상을 10개 정도의 구간으로 나누기
+            segments = 10
+            segment_duration = video_duration / segments
+            transcript_chunks = self.chunk_transcript(transcript, segments)
+            
+            for i, chunk in enumerate(transcript_chunks):
+                start_time = i * segment_duration
+                end_time = (i + 1) * segment_duration
+                time_segmented_transcript.append({
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "content": chunk
+                })
+                
         # 각 로고별 분석 수행
         analysis_results = {}
         for logo_name, logo_detections in logo_groups.items():
@@ -185,54 +205,30 @@ class LLMAnalyzer:
             # 평균 신뢰도 계산
             avg_confidence = sum(d["confidence"] for d in logo_detections) / len(logo_detections)
             
-            # 로고 노출 시간대별 대화 내용 추출 (대략적인 방법)
+            # 로고 노출 시간대별 대화 내용 추출
             context_dialogues = []
-            if transcript:
-                # 대본을 100개 정도의 청크로 나누어 대략적인 타임스탬프 매핑
-                chunks = self.chunk_transcript(transcript, 100)
-                video_duration = max(d["timestamp"] for d in detections) if detections else 0
-                
+            if transcript and time_segmented_transcript:
                 for detection in logo_detections:
                     timestamp = detection["timestamp"]
-                    # 타임스탬프에 해당하는 청크 인덱스 계산
-                    chunk_idx = int(timestamp / video_duration * len(chunks)) if video_duration > 0 else 0
-                    # 해당 청크와 그 전후 청크 추출
-                    start_idx = max(0, chunk_idx - 1)
-                    end_idx = min(len(chunks) - 1, chunk_idx + 1)
-                    context = " ".join(chunks[start_idx:end_idx+1])
-                    if context:
-                        context_dialogues.append({
-                            "timestamp": timestamp,
-                            "dialogue": context
-                        })
+                    # 해당 시간대의 대화 내용 찾기
+                    for segment in time_segmented_transcript:
+                        if segment["start_time"] <= timestamp < segment["end_time"]:
+                            context_dialogues.append({
+                                "timestamp": timestamp,
+                                "dialogue": segment["content"]
+                            })
+                            break
             
             # LLM에 분석 요청
-            prompt = f"""
-            다음은 드라마/예능 프로그램에서 감지된 {logo_name} 브랜드의 PPL 정보입니다:
-            - 총 노출 시간: {total_duration:.2f}초
-            - 노출 빈도: {frequency}회
-            - 평균 신뢰도: {avg_confidence:.2f}
-            """
-            
-            # 대화 내용이 있는 경우 추가
-            if context_dialogues:
-                prompt += f"\n\n해당 브랜드 노출 시 대화/상황 맥락 정보:"
-                for i, ctx in enumerate(context_dialogues):
-                    if i >= 5:  # 너무 많은 경우 5개만 표시
-                        prompt += f"\n\n(이하 {len(context_dialogues)-5}개 맥락 정보 생략...)"
-                        break
-                    prompt += f"\n\n시점 {ctx['timestamp']:.2f}초: {ctx['dialogue']}"
-            else:
-                prompt += "\n\n대화/상황 맥락 정보: 사용할 수 없음"
-            
-            prompt += f"""
-            
-            이 정보를 바탕으로 다음을 분석해주세요:
-            1. PPL 효과성 (1-10점)
-            2. 주요 노출 시점과 특징
-            3. 대화/상황 맥락과 PPL의 연관성
-            4. 개선 제안사항
-            """
+            prompt = self._create_analysis_prompt(
+                logo_name, 
+                total_duration, 
+                frequency, 
+                avg_confidence, 
+                context_dialogues, 
+                transcript, 
+                time_segmented_transcript
+            )
             
             try:
                 response = self.client.chat.completions.create(
@@ -260,6 +256,82 @@ class LLMAnalyzer:
         logger.debug(f"분석 결과: {analysis_results}")
         
         return analysis_results
+    
+    def _create_analysis_prompt(
+        self, 
+        logo_name: str, 
+        total_duration: float, 
+        frequency: int, 
+        avg_confidence: float, 
+        context_dialogues: List[Dict], 
+        full_transcript: str,
+        time_segmented_transcript: List[Dict]
+    ) -> str:
+        """
+        LLM 분석을 위한 프롬프트를 생성합니다.
+        
+        Args:
+            logo_name: 로고 이름
+            total_duration: 총 노출 시간
+            frequency: 노출 빈도
+            avg_confidence: 평균 신뢰도
+            context_dialogues: 로고 노출 시점의 대화 내용
+            full_transcript: 전체 대본
+            time_segmented_transcript: 시간대별로 나눈 대본
+            
+        Returns:
+            str: 분석 프롬프트
+        """
+        prompt = f"""
+        다음은 드라마/예능 프로그램에서 감지된 {logo_name} 브랜드의 PPL 정보입니다:
+        
+        # 기본 통계
+        - 총 노출 시간: {total_duration:.2f}초
+        - 노출 빈도: {frequency}회
+        - 평균 신뢰도: {avg_confidence:.2f}
+        """
+        
+        # 노출 시점별 대화 내용 추가
+        if context_dialogues:
+            prompt += f"\n\n# 브랜드 노출 시점의 대화/상황 맥락:"
+            for i, ctx in enumerate(context_dialogues):
+                if i >= 5:  # 너무 많은 경우 5개만 표시
+                    prompt += f"\n\n(이하 {len(context_dialogues)-5}개 맥락 정보 생략...)"
+                    break
+                prompt += f"\n\n## 시점 {ctx['timestamp']:.2f}초:"
+                prompt += f"\n{ctx['dialogue']}"
+        
+        # 전체 대본 요약 추가 (너무 길면 일부만)
+        if full_transcript:
+            summary_length = min(len(full_transcript), 1500)  # 너무 길면 잘라서 제공
+            prompt += f"\n\n# 전체 대본 요약 (처음 일부):"
+            prompt += f"\n{full_transcript[:summary_length]}"
+            
+            if len(full_transcript) > summary_length:
+                prompt += "\n...(이하 생략)..."
+        
+        # 시간대별 대본 추가
+        if time_segmented_transcript:
+            prompt += f"\n\n# 시간대별 대본:"
+            for segment in time_segmented_transcript:
+                # 각 세그먼트마다 간단한 요약만 포함
+                summary = segment["content"][:200] + ("..." if len(segment["content"]) > 200 else "")
+                prompt += f"\n\n## {segment['start_time']:.2f}초 ~ {segment['end_time']:.2f}초:"
+                prompt += f"\n{summary}"
+        
+        prompt += f"""
+        
+        # 분석 요청
+        위 정보를 바탕으로 다음을 분석해주세요:
+        
+        1. PPL 효과성 (1-10점) 및 점수 선정 이유
+        2. 주요 노출 시점과 특징 분석
+        3. 대화/상황 맥락과 PPL의 연관성 (맥락 활용이 효과적인지)
+        4. 시청자의 시선을 끌기 위한 전략이 있었는지 분석
+        5. PPL의 자연스러움 및 개선 제안사항
+        """
+        
+        return prompt.strip()
         
     def chunk_transcript(self, transcript: str, num_chunks: int) -> List[str]:
         """
